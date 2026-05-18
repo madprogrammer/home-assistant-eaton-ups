@@ -21,6 +21,7 @@ from .const import (
     SNMP_OID_RECEP_STATUS,
     UPS_SHUTDOWN_CANCEL_VALUE,
     UPS_SHUTDOWN_DELAY_SECONDS,
+    UPS_STARTUP_DELAY_SECONDS,
     OutputSource,
     ReceptacleStatus,
 )
@@ -99,7 +100,7 @@ class SnmpUpsOutputSwitchEntity(SnmpEntity, SwitchEntity):
             )
         elif not self._output_powered():
             await self.coordinator._api.set(
-                [(SNMP_OID_CONTROL_OUTPUT_ON_DELAY, 0)]
+                [(SNMP_OID_CONTROL_OUTPUT_ON_DELAY, UPS_STARTUP_DELAY_SECONDS)]
             )
         await self.coordinator.async_refresh()
 
