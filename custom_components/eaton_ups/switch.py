@@ -14,13 +14,14 @@ from .const import (
     RECEP_TOGGLE_DELAY_SECONDS,
     SNMP_OID_CONTROL_OUTPUT_OFF_DELAY,
     SNMP_OID_CONTROL_OUTPUT_ON_DELAY,
-    SNMP_OID_OUTPUT_STATUS,
+    SNMP_OID_OUTPUT_SOURCE,
     SNMP_OID_RECEP_COUNT,
     SNMP_OID_RECEP_OFF_DELAY,
     SNMP_OID_RECEP_ON_DELAY,
     SNMP_OID_RECEP_STATUS,
     UPS_SHUTDOWN_CANCEL_VALUE,
     UPS_SHUTDOWN_DELAY_SECONDS,
+    OutputSource,
     ReceptacleStatus,
 )
 from .coordinator import SnmpCoordinator
@@ -45,21 +46,26 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-OUTPUT_STATUS_NOT_POWERED = 1
+_OUTPUT_OFF_SOURCES = {OutputSource.other.value, OutputSource.none.value}
 
 
 class SnmpUpsOutputSwitchEntity(SnmpEntity, SwitchEntity):
     """Switch representing the UPS output as a whole.
 
-    ON  → output is currently powered and no shutdown countdown is active.
-    OFF → either xupsControlOutputOffDelay has a positive countdown running,
-          or xupsOutputStatus reports the output is not powered.
+    ON  → output is currently powered (xupsOutputSource reports a real
+          source like normal/bypass/battery/...) and no shutdown countdown
+          is active.
+    OFF → either xupsControlOutputOffDelay has a positive countdown
+          running, or xupsOutputSource reports `none`/`other`.
 
-    Turn-on logic chooses between OffDelay=-1 (cancel a pending shutdown,
-    the only case where -1 is accepted by the 9SX firmware without a
-    badValue error) and OnDelay=0 (start the output back up when it is
-    actually off). Turn-off always writes UPS_SHUTDOWN_DELAY_SECONDS to
-    OffDelay.
+    On the 9SX firmware xupsOutputStatus (534.1.4.10) is not implemented,
+    so we key off xupsOutputSource (534.1.4.5) instead — that returns 2
+    when the output is down and 3..12 when it is powered by some source.
+
+    Turn-on chooses between OffDelay=-1 (cancel a pending shutdown — the
+    only case where -1 is accepted; the firmware otherwise responds
+    badValue) and OnDelay=0 (cold start when output is actually off).
+    Turn-off always writes UPS_SHUTDOWN_DELAY_SECONDS to OffDelay.
     """
 
     _attr_device_class = SwitchDeviceClass.OUTLET
@@ -74,14 +80,16 @@ class SnmpUpsOutputSwitchEntity(SnmpEntity, SwitchEntity):
         except (TypeError, ValueError):
             return default
 
+    def _output_powered(self) -> bool:
+        source = self._int(SNMP_OID_OUTPUT_SOURCE, default=OutputSource.none.value)
+        return source not in _OUTPUT_OFF_SOURCES
+
     @property
     def is_on(self) -> bool:
         """Return True only when the output is up and no shutdown is pending."""
         if self._int(SNMP_OID_CONTROL_OUTPUT_OFF_DELAY) > 0:
             return False
-        if self._int(SNMP_OID_OUTPUT_STATUS) == OUTPUT_STATUS_NOT_POWERED:
-            return False
-        return True
+        return self._output_powered()
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Cancel a pending shutdown or power the output back up."""
@@ -89,7 +97,7 @@ class SnmpUpsOutputSwitchEntity(SnmpEntity, SwitchEntity):
             await self.coordinator._api.set(
                 [(SNMP_OID_CONTROL_OUTPUT_OFF_DELAY, UPS_SHUTDOWN_CANCEL_VALUE)]
             )
-        elif self._int(SNMP_OID_OUTPUT_STATUS) == OUTPUT_STATUS_NOT_POWERED:
+        elif not self._output_powered():
             await self.coordinator._api.set(
                 [(SNMP_OID_CONTROL_OUTPUT_ON_DELAY, 0)]
             )
