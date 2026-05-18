@@ -56,14 +56,20 @@ async def async_setup_entry(
 
 
 class _TransitionMixin:
-    """Adds an optimistic 'pending' state with a timed unavailability window.
+    """Track an optimistic 'pending' state for the duration of a UPS
+    transition (the polled OIDs lag the actual hardware by up to tens of
+    seconds, and the countdown OIDs decrement too quickly to observe).
 
-    The polling coordinator can lag the actual UPS state by tens of seconds,
-    and the firmware countdown OIDs can decrement faster than we can read
-    them — so a click would otherwise produce no visible feedback. Instead
-    we set a local flag immediately, show the expected on/off state, mark
-    the entity unavailable, and clear the flag after a generous window
-    (then trigger a refresh to settle on real polled state).
+    While pending: the entity reports its expected post-action is_on so
+    the user sees immediate feedback, and additional turn_on/turn_off
+    calls are silently ignored. The flag is cleared by async_call_later
+    after a generous window, then a coordinator refresh re-syncs with
+    real polled state.
+
+    The entity does NOT report available=False during this window
+    because Mushroom (and the rest of the HA frontend) renders that as
+    'Unavailable', which is the wrong word for an in-progress
+    transition.
     """
 
     _pending: bool = False
@@ -120,12 +126,6 @@ class SnmpUpsOutputSwitchEntity(_TransitionMixin, SnmpEntity, SwitchEntity):
         return source not in _OUTPUT_OFF_SOURCES
 
     @property
-    def available(self) -> bool:
-        if not super().available:
-            return False
-        return not self._pending
-
-    @property
     def is_on(self) -> bool:
         if self._pending:
             return self._pending_is_on
@@ -135,6 +135,8 @@ class SnmpUpsOutputSwitchEntity(_TransitionMixin, SnmpEntity, SwitchEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Cancel a pending shutdown or power the output back up."""
+        if self._pending:
+            return
         if self._int(SNMP_OID_CONTROL_OUTPUT_OFF_DELAY) > 0:
             self._begin_pending(True, _CANCEL_PENDING_WINDOW)
             await self.coordinator._api.set(
@@ -150,6 +152,8 @@ class SnmpUpsOutputSwitchEntity(_TransitionMixin, SnmpEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Initiate a delayed UPS shutdown."""
+        if self._pending:
+            return
         self._begin_pending(False, _SHUTDOWN_PENDING_WINDOW)
         await self.coordinator._api.set(
             [(SNMP_OID_CONTROL_OUTPUT_OFF_DELAY, UPS_SHUTDOWN_DELAY_SECONDS)]
@@ -182,12 +186,6 @@ class SnmpReceptacleSwitchEntity(_TransitionMixin, SnmpEntity, SwitchEntity):
             return None
 
     @property
-    def available(self) -> bool:
-        if not super().available:
-            return False
-        return not self._pending
-
-    @property
     def is_on(self) -> bool:
         if self._pending:
             return self._pending_is_on
@@ -197,6 +195,8 @@ class SnmpReceptacleSwitchEntity(_TransitionMixin, SnmpEntity, SwitchEntity):
         return status in (ReceptacleStatus.on.value, ReceptacleStatus.pending_off.value)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        if self._pending:
+            return
         self._begin_pending(True, _RECEP_PENDING_WINDOW)
         await self.coordinator._api.set(
             [(self._on_delay_oid, RECEP_TOGGLE_DELAY_SECONDS)]
@@ -204,6 +204,8 @@ class SnmpReceptacleSwitchEntity(_TransitionMixin, SnmpEntity, SwitchEntity):
         await self.coordinator.async_refresh()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
+        if self._pending:
+            return
         self._begin_pending(False, _RECEP_PENDING_WINDOW)
         await self.coordinator._api.set(
             [(self._off_delay_oid, RECEP_TOGGLE_DELAY_SECONDS)]
