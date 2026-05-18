@@ -22,6 +22,8 @@ from .const import (
     SNMP_OID_BATTERY_REMAINING,
     SNMP_OID_BATTERY_TEST_STATUS,
     SNMP_OID_BATTERY_VOLTAGE,
+    SNMP_OID_CONTROL_OUTPUT_OFF_DELAY,
+    SNMP_OID_CONTROL_OUTPUT_ON_DELAY,
     SNMP_OID_IDENT_FIRMWARE_VERSION,
     SNMP_OID_IDENT_FIRMWARE_VERSION_XUPS,
     SNMP_OID_IDENT_PART_NUMBER,
@@ -47,6 +49,8 @@ from .const import (
     SNMP_OID_OUTPUT_STATUS,
     SNMP_OID_OUTPUT_VOLTAGE,
     SNMP_OID_OUTPUT_WATTS,
+    SNMP_OID_RECEP_COUNT,
+    SNMP_OID_RECEP_STATUS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -91,6 +95,9 @@ class SnmpCoordinator(DataUpdateCoordinator):
             SNMP_OID_BATTERY_AGED,
             SNMP_OID_BATTERY_LOW_CAPACITY,
             SNMP_OID_BATTERY_TEST_STATUS,
+            SNMP_OID_CONTROL_OUTPUT_OFF_DELAY,
+            SNMP_OID_CONTROL_OUTPUT_ON_DELAY,
+            SNMP_OID_RECEP_COUNT,
         ]
 
     async def _update_data(self) -> dict:
@@ -129,6 +136,14 @@ class SnmpCoordinator(DataUpdateCoordinator):
                         SNMP_OID_OUTPUT_LOAD.replace("index", ""),
                     ],
                     output_count,
+                ):
+                    self.data.update(result)
+
+            recep_count = self.data.get(SNMP_OID_RECEP_COUNT, 0)
+            if recep_count > 0:
+                for result in await self._api.get_bulk(
+                    [SNMP_OID_RECEP_STATUS.replace("index", "")],
+                    recep_count,
                 ):
                     self.data.update(result)
 

@@ -185,6 +185,35 @@ class SnmpApi:
             oids, await self.get([count_oid])[count_oid], start_from
         )
 
+    async def set(self, bindings: list[tuple[str, int]]) -> dict:
+        """Issue SNMP SET for one or more (oid, integer-value) pairs."""
+        _LOGGER.debug("Set OID(s) %s", bindings)
+
+        object_types = [
+            hlapi.ObjectType(hlapi.ObjectIdentity(oid), hlapi.Integer32(value))
+            for oid, value in bindings
+        ]
+
+        (
+            error_indication,
+            error_status,
+            error_index,
+            var_binds,
+        ) = await hlapi.set_cmd(
+            self._snmpEngine,
+            self._credentials,
+            self._target,
+            hlapi.ContextData(),
+            *object_types,
+        )
+
+        if error_indication or error_status:
+            raise RuntimeError(
+                f"Got SNMP error: {error_indication} {error_status} {error_index}"
+            )
+
+        return {str(var_bind[0]): __class__.cast(var_bind[1]) for var_bind in var_binds}
+
     @staticmethod
     def cast(value):
         """Cast returned value into correct type."""

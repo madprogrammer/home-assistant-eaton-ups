@@ -13,6 +13,7 @@ MANUFACTURER = "Eaton"
 PLATFORMS = [
     Platform.BINARY_SENSOR,
     Platform.SENSOR,
+    Platform.SWITCH,
 ]
 
 ATTR_NAME = "name"
@@ -88,6 +89,19 @@ SNMP_OID_INPUT_WATTS = "1.3.6.1.4.1.534.1.3.4.1.4.index"
 SNMP_OID_INPUT_NAME = "1.3.6.1.4.1.534.1.3.4.1.6.index"
 SNMP_OID_INPUT_SOURCE = "1.3.6.1.4.1.534.1.3.5.0"
 SNMP_OID_INPUT_STATUS = "1.3.6.1.4.1.534.1.3.9.0"
+
+SNMP_OID_CONTROL_OUTPUT_OFF_DELAY = "1.3.6.1.4.1.534.1.9.1.0"
+SNMP_OID_CONTROL_OUTPUT_ON_DELAY = "1.3.6.1.4.1.534.1.9.2.0"
+
+SNMP_OID_RECEP_COUNT = "1.3.6.1.4.1.534.1.12.1.0"
+SNMP_OID_RECEP_INDEX = "1.3.6.1.4.1.534.1.12.2.1.1.index"
+SNMP_OID_RECEP_STATUS = "1.3.6.1.4.1.534.1.12.2.1.2.index"
+SNMP_OID_RECEP_OFF_DELAY = "1.3.6.1.4.1.534.1.12.2.1.3.index"
+SNMP_OID_RECEP_ON_DELAY = "1.3.6.1.4.1.534.1.12.2.1.4.index"
+
+UPS_SHUTDOWN_DELAY_SECONDS = 30
+UPS_SHUTDOWN_CANCEL_VALUE = -1
+RECEP_TOGGLE_DELAY_SECONDS = 0
 
 SNMP_OID_OUTPUT_NUM_PHASES = "1.3.6.1.4.1.534.1.4.3.0"
 SNMP_OID_OUTPUT_PHASE = "1.3.6.1.4.1.534.1.4.4.1.1.index"
@@ -178,3 +192,12 @@ class OutputStatus(Enum):
     output_not_protected = 2
     output_protected = 3
     output_powered_no_continuity = 4
+
+
+class ReceptacleStatus(Enum):
+    """Values for xupsRecepStatus (output group on/off state)."""
+
+    on = 1
+    off = 2
+    pending_off = 3
+    pending_on = 4
