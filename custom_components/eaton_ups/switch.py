@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
@@ -10,6 +9,7 @@ from homeassistant.components.switch import SwitchDeviceClass, SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_call_later
 
 from .const import (
     RECEP_TOGGLE_DELAY_SECONDS,
@@ -33,6 +33,13 @@ _LOGGER = logging.getLogger(__name__)
 
 PARALLEL_UPDATES = 1
 
+_OUTPUT_OFF_SOURCES = {OutputSource.other.value, OutputSource.none.value}
+
+_STARTUP_PENDING_WINDOW = 10
+_SHUTDOWN_PENDING_WINDOW = UPS_SHUTDOWN_DELAY_SECONDS + 5
+_CANCEL_PENDING_WINDOW = 5
+_RECEP_PENDING_WINDOW = 6
+
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
@@ -48,34 +55,52 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-_OUTPUT_OFF_SOURCES = {OutputSource.other.value, OutputSource.none.value}
-_REFRESH_GRACE_SECONDS = 3
+class _TransitionMixin:
+    """Adds an optimistic 'pending' state with a timed unavailability window.
+
+    The polling coordinator can lag the actual UPS state by tens of seconds,
+    and the firmware countdown OIDs can decrement faster than we can read
+    them — so a click would otherwise produce no visible feedback. Instead
+    we set a local flag immediately, show the expected on/off state, mark
+    the entity unavailable, and clear the flag after a generous window
+    (then trigger a refresh to settle on real polled state).
+    """
+
+    _pending: bool = False
+    _pending_is_on: bool = False
+    _pending_cancel: Any = None
+
+    def _begin_pending(self, expected_is_on: bool, window_seconds: float) -> None:
+        if self._pending_cancel is not None:
+            self._pending_cancel()
+            self._pending_cancel = None
+
+        self._pending = True
+        self._pending_is_on = expected_is_on
+        self.async_write_ha_state()
+
+        @callback
+        def _clear(_now):
+            self._pending_cancel = None
+            self._pending = False
+            self.async_write_ha_state()
+            self.hass.async_create_task(self.coordinator.async_refresh())
+
+        self._pending_cancel = async_call_later(self.hass, window_seconds, _clear)
 
 
-async def _schedule_followup_refresh(coordinator: SnmpCoordinator, delay: float) -> None:
-    """Sleep `delay` seconds, then trigger a coordinator refresh so the entity
-    state catches up to the actual outcome without waiting for the next poll."""
-    await asyncio.sleep(delay)
-    await coordinator.async_refresh()
-
-
-class SnmpUpsOutputSwitchEntity(SnmpEntity, SwitchEntity):
+class SnmpUpsOutputSwitchEntity(_TransitionMixin, SnmpEntity, SwitchEntity):
     """Switch representing the UPS output as a whole.
 
-    ON  → output is currently powered (xupsOutputSource reports a real
-          source like normal/bypass/battery/...) and no shutdown countdown
-          is active.
-    OFF → either xupsControlOutputOffDelay has a positive countdown
-          running, or xupsOutputSource reports `none`/`other`.
+    State is derived from xupsOutputSource (534.1.4.5) — the 9SX does not
+    implement xupsOutputStatus (534.1.4.10), so the source field is the
+    only reliable signal: 2 = none (output off), 3..12 = some real power
+    source (output on).
 
-    On the 9SX firmware xupsOutputStatus (534.1.4.10) is not implemented,
-    so we key off xupsOutputSource (534.1.4.5) instead — that returns 2
-    when the output is down and 3..12 when it is powered by some source.
-
-    Turn-on chooses between OffDelay=-1 (cancel a pending shutdown — the
-    only case where -1 is accepted; the firmware otherwise responds
-    badValue) and OnDelay=0 (cold start when output is actually off).
-    Turn-off always writes UPS_SHUTDOWN_DELAY_SECONDS to OffDelay.
+    Turn-on picks between OffDelay=-1 (cancel a pending shutdown — the
+    only case where -1 is accepted by the firmware) and OnDelay=1 (cold
+    start when the output is actually off; OnDelay=0 is a no-op on this
+    firmware).
     """
 
     _attr_device_class = SwitchDeviceClass.OUTLET
@@ -96,61 +121,47 @@ class SnmpUpsOutputSwitchEntity(SnmpEntity, SwitchEntity):
 
     @property
     def available(self) -> bool:
-        """Disable the switch while a shutdown or startup countdown is active."""
         if not super().available:
             return False
-        if self._int(SNMP_OID_CONTROL_OUTPUT_OFF_DELAY) > 0:
-            return False
-        if self._int(SNMP_OID_CONTROL_OUTPUT_ON_DELAY) > 0:
-            return False
-        return True
+        return not self._pending
 
     @property
     def is_on(self) -> bool:
-        """Return True only when the output is up and no shutdown is pending."""
+        if self._pending:
+            return self._pending_is_on
         if self._int(SNMP_OID_CONTROL_OUTPUT_OFF_DELAY) > 0:
             return False
         return self._output_powered()
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Cancel a pending shutdown or power the output back up."""
-        followup_delay = 0
         if self._int(SNMP_OID_CONTROL_OUTPUT_OFF_DELAY) > 0:
+            self._begin_pending(True, _CANCEL_PENDING_WINDOW)
             await self.coordinator._api.set(
                 [(SNMP_OID_CONTROL_OUTPUT_OFF_DELAY, UPS_SHUTDOWN_CANCEL_VALUE)]
             )
-            followup_delay = _REFRESH_GRACE_SECONDS
         elif not self._output_powered():
+            self._begin_pending(True, _STARTUP_PENDING_WINDOW)
             await self.coordinator._api.set(
                 [(SNMP_OID_CONTROL_OUTPUT_ON_DELAY, UPS_STARTUP_DELAY_SECONDS)]
             )
-            followup_delay = UPS_STARTUP_DELAY_SECONDS + _REFRESH_GRACE_SECONDS
+        # else: already on, no shutdown pending → no-op
         await self.coordinator.async_refresh()
-        if followup_delay:
-            self.hass.async_create_task(
-                _schedule_followup_refresh(self.coordinator, followup_delay)
-            )
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Initiate a delayed UPS shutdown."""
+        self._begin_pending(False, _SHUTDOWN_PENDING_WINDOW)
         await self.coordinator._api.set(
             [(SNMP_OID_CONTROL_OUTPUT_OFF_DELAY, UPS_SHUTDOWN_DELAY_SECONDS)]
         )
         await self.coordinator.async_refresh()
-        self.hass.async_create_task(
-            _schedule_followup_refresh(
-                self.coordinator,
-                UPS_SHUTDOWN_DELAY_SECONDS + _REFRESH_GRACE_SECONDS,
-            )
-        )
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
         self.async_write_ha_state()
 
 
-class SnmpReceptacleSwitchEntity(SnmpEntity, SwitchEntity):
+class SnmpReceptacleSwitchEntity(_TransitionMixin, SnmpEntity, SwitchEntity):
     """Switch that toggles a single UPS output group (receptacle)."""
 
     _attr_device_class = SwitchDeviceClass.OUTLET
@@ -159,7 +170,6 @@ class SnmpReceptacleSwitchEntity(SnmpEntity, SwitchEntity):
     _value_oid = SNMP_OID_RECEP_STATUS
 
     def __init__(self, coordinator: SnmpCoordinator, index: int) -> None:
-        """Initialize a receptacle switch."""
         self._name_suffix = str(index)
         super().__init__(coordinator, index)
         self._on_delay_oid = SNMP_OID_RECEP_ON_DELAY.replace("index", str(index))
@@ -173,50 +183,33 @@ class SnmpReceptacleSwitchEntity(SnmpEntity, SwitchEntity):
 
     @property
     def available(self) -> bool:
-        """Disable the switch while the receptacle is mid-transition."""
         if not super().available:
             return False
-        status = self._status()
-        return status not in (
-            ReceptacleStatus.pending_off.value,
-            ReceptacleStatus.pending_on.value,
-        )
+        return not self._pending
 
     @property
     def is_on(self) -> bool:
-        """Return True when the receptacle is powered (or about to be)."""
+        if self._pending:
+            return self._pending_is_on
         status = self._status()
         if status is None:
             return False
         return status in (ReceptacleStatus.on.value, ReceptacleStatus.pending_off.value)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Power the receptacle on (after a 1 s firmware-minimum delay)."""
+        self._begin_pending(True, _RECEP_PENDING_WINDOW)
         await self.coordinator._api.set(
             [(self._on_delay_oid, RECEP_TOGGLE_DELAY_SECONDS)]
         )
         await self.coordinator.async_refresh()
-        self.hass.async_create_task(
-            _schedule_followup_refresh(
-                self.coordinator,
-                RECEP_TOGGLE_DELAY_SECONDS + _REFRESH_GRACE_SECONDS,
-            )
-        )
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Power the receptacle off (after a 1 s firmware-minimum delay)."""
+        self._begin_pending(False, _RECEP_PENDING_WINDOW)
         await self.coordinator._api.set(
             [(self._off_delay_oid, RECEP_TOGGLE_DELAY_SECONDS)]
         )
         await self.coordinator.async_refresh()
-        self.hass.async_create_task(
-            _schedule_followup_refresh(
-                self.coordinator,
-                RECEP_TOGGLE_DELAY_SECONDS + _REFRESH_GRACE_SECONDS,
-            )
-        )
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
         self.async_write_ha_state()
